@@ -1,0 +1,113 @@
+import React, { useEffect, useState, useRef } from 'react';
+import DeckGL from '@deck.gl/react';
+import { Map } from 'react-map-gl/mapbox';
+import { IconLayer } from '@deck.gl/layers';
+
+interface VehiclePosition {
+  id: string;
+  currentLat: float;
+  currentLon: float;
+  targetLat: float;
+  targetLon: float;
+  delayStatus: 'ON_TIME' | 'MINOR_DELAY' | 'SEVERE_DELAY';
+  bearing: number;
+}
+
+const INITIAL_VIEW_STATE = {
+  longitude: 13.4050,
+  latitude: 52.5200,
+  zoom: 12,
+  pitch: 30,
+  bearing: 0
+};
+
+export const LiveFleetMap: React.FC<{ socketUrl: string }> = ({ socketUrl }) => {
+  const [vehicles, setVehicles] = useState<Map<string, VehiclePosition>>(new Map());
+  const animFrameRef = useRef<number>();
+
+  // 1. Listen for 1Hz WebSocket updates from Phase 3, Section 1.2
+  useEffect(() => {
+    const ws = new WebSocket(socketUrl);
+    ws.onmessage = (event) => {
+      const payload = JSON.parse(event.data);
+      setVehicles((prev) => {
+        const next = new Map(prev);
+        const existing = next.get(payload.vehicle_id);
+        
+        next.set(payload.vehicle_id, {
+          id: payload.vehicle_id,
+          // Set target coordinates for linear interpolation (lerp)
+          currentLat: existing ? existing.currentLat : payload.latitude,
+          currentLon: existing ? existing.currentLon : payload.longitude,
+          targetLat: payload.latitude,
+          targetLon: payload.longitude,
+          delayStatus: payload.delay_status,
+          bearing: payload.bearing
+        });
+        return next;
+      });
+    };
+    return () => ws.close();
+  }, [socketUrl]);
+
+  // 2. 60 FPS Interpolation Loop for smooth movement between 1Hz ticks
+  useEffect(() => {
+    const interpolatePositions = () => {
+      setVehicles((prevVehicles) => {
+        let needsUpdate = false;
+        const updated = new Map();
+
+        prevVehicles.forEach((v) => {
+          // Lerp factor (alpha = 0.1 for smooth movement over frame steps)
+          const newLat = v.currentLat + (v.targetLat - v.currentLat) * 0.1;
+          const newLon = v.currentLon + (v.targetLon - v.currentLon) * 0.1;
+
+          if (Math.abs(v.targetLat - newLat) > 0.00001) needsUpdate = true;
+
+          updated.set(v.id, { ...v, currentLat: newLat, currentLon: newLon });
+        });
+
+        return needsUpdate ? updated : prevVehicles;
+      });
+
+      animFrameRef.current = requestAnimationFrame(interpolatePositions);
+    };
+
+    animFrameRef.current = requestAnimationFrame(interpolatePositions);
+    return () => cancelAnimationFrame(animFrameRef.current!);
+  }, []);
+
+  // 3. WebGL Layer Definition
+  const layers = [
+    new IconLayer({
+      id: 'vehicle-markers',
+      data: Array.from(vehicles.values()),
+      getPosition: (d: VehiclePosition) => [d.currentLon, d.currentLat],
+      getIcon: (d: VehiclePosition) => ({
+        url: '/assets/bus-icon.png',
+        width: 128,
+        height: 128,
+        anchorY: 64
+      }),
+      getSize: 32,
+      getAngle: (d: VehiclePosition) => 360 - d.bearing,
+      getColor: (d: VehiclePosition) => {
+        switch (d.delayStatus) {
+          case 'SEVERE_DELAY': return [239, 68, 68];  // Red
+          case 'MINOR_DELAY': return [245, 158, 11];  // Yellow
+          default: return [34, 197, 94];              // Green
+        }
+      },
+      updateTriggers: {
+        getPosition: [vehicles],
+        getColor: [vehicles]
+      }
+    })
+  ];
+
+  return (
+    <DeckGL initialViewState={INITIAL_VIEW_STATE} controller={true} layers={layers}>
+      <Map mapboxAccessToken="YOUR_MAPBOX_TOKEN" mapStyle="mapbox://styles/mapbox/dark-v11" />
+    </DeckGL>
+  );
+};
