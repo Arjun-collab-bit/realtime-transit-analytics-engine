@@ -1,0 +1,102 @@
+import asyncio
+import json
+import logging
+import httpx
+import aioredis
+from aiokafka import AIOKafkaConsumer
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("AlertDispatcher")
+
+KAFKA_BOOTSTRAP_SERVERS = "kafka-broker:9092"
+ALERT_TOPIC = "transit.alerts.triggered"
+REDIS_URL = "redis://redis-cluster:6379"
+
+# Webhook Endpoints
+SLACK_WEBHOOK_URL = "https://hooks.slack.com/services/T00/B00/X00"
+PAGERDUTY_EVENTS_API = "https://events.pagerduty.com/v2/enqueue"
+
+class AlertDispatcher:
+    def __init__(self):
+        self.http_client = httpx.AsyncClient(timeout=5.0)
+        self.redis = None
+
+    async def start(self):
+        self.redis = await aioredis.from_url(REDIS_URL)
+        consumer = AIOKafkaConsumer(
+            ALERT_TOPIC,
+            bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+            group_id="alert-dispatch-group",
+            value_deserializer=lambda v: json.loads(v.decode('utf-8'))
+        )
+        await consumer.start()
+        logger.info("Alert Dispatcher initialized. Listening for alerts...")
+
+        try:
+            async for msg in consumer:
+                alert = msg.value
+                await self.process_alert(alert)
+        finally:
+            await consumer.stop()
+            await self.http_client.aclose()
+
+    async def is_suppressed(self, alert_key: str, cooldown_seconds: int = 900) -> bool:
+        """Checks Redis to prevent alerting on the same vehicle/incident within cooldown window."""
+        key = f"alert_cooldown:{alert_key}"
+        is_set = await self.redis.set(key, "1", ex=cooldown_seconds, nx=True)
+        return not is_set  # If set returned None, the key already existed (suppressed)
+
+    async def process_alert(self, alert: dict):
+        vehicle_id = alert.get("vehicle_id")
+        alert_type = alert.get("alert_type")
+        severity = alert.get("severity", "MEDIUM")
+        
+        cooldown_key = f"{vehicle_id}:{alert_type}"
+        if await self.is_suppressed(cooldown_key):
+            logger.info(f"Alert {cooldown_key} suppressed due to cooldown.")
+            return
+
+        logger.warning(f"Dispatching [{severity}] Alert: {alert_type} for Vehicle {vehicle_id}")
+
+        # Route based on severity
+        tasks = []
+        if severity in ["MEDIUM", "HIGH"]:
+            tasks.append(self.send_slack_notification(alert))
+        if severity == "CRITICAL":
+            tasks.append(self.send_slack_notification(alert))
+            tasks.append(self.trigger_pagerduty(alert))
+
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def send_slack_notification(self, alert: dict):
+        payload = {
+            "text": f"🚨 *TRANSIT INCIDENT ALERT [{alert['severity']}]*",
+            "attachments": [{
+                "color": "#EF4444" if alert['severity'] == "CRITICAL" else "#F59E0B",
+                "fields": [
+                    {"title": "Vehicle ID", "value": alert["vehicle_id"], "short": True},
+                    {"title": "Route ID", "value": alert["route_id"], "short": True},
+                    {"title": "Incident", "value": alert["alert_type"], "short": True},
+                    {"title": "Details", "value": alert.get("description", "N/A"), "short": False}
+                ]
+            }]
+        }
+        await self.http_client.post(SLACK_WEBHOOK_URL, json=payload)
+
+    async def trigger_pagerduty(self, alert: dict):
+        payload = {
+            "routing_key": "YOUR_PAGERDUTY_INTEGRATION_KEY",
+            "event_action": "trigger",
+            "dedup_key": f"{alert['vehicle_id']}_{alert['alert_type']}",
+            "payload": {
+                "summary": f"CRITICAL INCIDENT: {alert['alert_type']} on Vehicle {alert['vehicle_id']}",
+                "source": "transit-analytics-engine",
+                "severity": "critical",
+                "custom_details": alert
+            }
+        }
+        await self.http_client.post(PAGERDUTY_EVENTS_API, json=payload)
+
+if __name__ == "__main__":
+    dispatcher = AlertDispatcher()
+    asyncio.run(dispatcher.start())
